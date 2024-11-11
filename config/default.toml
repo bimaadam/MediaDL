@@ -1,0 +1,58 @@
+# Non-secret defaults. Credentials are read from the process environment.
+
+environment = "development"
+
+[server]
+bind = "0.0.0.0:8080"
+request_timeout_secs = 30
+
+[worker]
+concurrency = 4
+per_platform_concurrency = 2
+id = ""
+
+[postgres]
+max_connections = 10
+url = ""
+
+[redis]
+url = ""
+stream = "media:jobs"
+group = "media-workers"
+dead_stream = "media:jobs:dead"
+
+[storage]
+endpoint = "http://127.0.0.1:9000"
+region = "us-east-1"
+bucket = "media"
+access_key = ""
+secret_key = ""
+
+[tools]
+ytdlp = "yt-dlp"
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+
+[telegram]
+enabled = false
+bot_id = ""
+token = ""
+
+[limits]
+max_download_bytes = 2147483648
+download_timeout_secs = 900
+tool_timeout_secs = 600
+lock_ttl_secs = 30
+lease_secs = 60
+lease_renew_secs = 20
+artifact_cache_secs = 604800
+metadata_cache_secs = 21600
+telegram_file_secs = 2592000
+max_attempts = 5
+rate_limit_per_minute = 20
+daily_quota = 100
+telegram_max_upload_bytes = 52428800
+job_expiry_secs = 86400
+
+[observability]
+metrics_bind = "127.0.0.1:9090"

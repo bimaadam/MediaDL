@@ -1,0 +1,7 @@
+# Local development. MIGRATE_ON_START is honored only in this environment.
+
+[postgres]
+max_connections = 5
+
+[observability]
+metrics_bind = "127.0.0.1:9090"

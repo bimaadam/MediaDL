@@ -1,0 +1,13 @@
+[worker]
+concurrency = 4
+per_platform_concurrency = 2
+
+[postgres]
+max_connections = 15
+
+[limits]
+rate_limit_per_minute = 30
+daily_quota = 200
+
+[observability]
+metrics_bind = "127.0.0.1:9090"

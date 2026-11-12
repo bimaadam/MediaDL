@@ -5,8 +5,8 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::domain::{
-    Actor, Artifact, ArtifactStatus, CachedArtifact, DomainError, Job, MediaIdentity,
-    ProcessingProfile, RetryPolicy, identify_url,
+    Actor, Artifact, ArtifactStatus, CachedArtifact, DomainError, Job, MediaIdentity, PlatformKind,
+    ProcessingProfile, RetryPolicy, asks_for_instagram_slide, identify_url,
 };
 
 use super::error::AppError;
@@ -62,14 +62,72 @@ impl Engine {
         &self.config
     }
 
-    /// A public Facebook photo post is fetched as a photo. Everything else starts as video.
+    /// A public Facebook album, including a swipeable mix of photos and videos,
+    /// is fetched as every attachment. A single video starts as video.
     pub async fn preferred_profile(&self, raw_url: &str) -> Result<ProcessingProfile, AppError> {
         let url = self.guard.validate(raw_url).await?;
         let identified = self.platforms.identify(&url).await?;
         if self.metadata.has_public_photos(&identified).await? {
             return Ok(ProcessingProfile::best_image());
         }
-        Ok(ProcessingProfile::best_video())
+        if identified.platform == PlatformKind::Instagram
+            && let Ok(parsed) = url::Url::parse(&identified.canonical_url)
+            && asks_for_instagram_slide(&parsed)
+        {
+            return Ok(ProcessingProfile::best_image());
+        }
+        Ok(ProcessingProfile::best_video().within(self.config.telegram_max_upload_bytes))
+    }
+
+    /// Profiles for the menu. Comes from cached or freshly read platform metadata.
+    /// A lookup failure returns no invented resolutions.
+    pub async fn available_profiles(
+        &self,
+        raw_url: &str,
+    ) -> Result<Vec<ProcessingProfile>, AppError> {
+        let url = self.guard.validate(raw_url).await?;
+        let identified = self.platforms.identify(&url).await?;
+        let mut profiles = if let Some(cached) =
+            self.cache.get_metadata(identified.platform, identified.content_id.as_str()).await?
+        {
+            self.fit_telegram(cached.profiles)
+        } else {
+            let metadata =
+                self.metadata.inspect(&identified, &ProcessingProfile::best_video()).await?;
+            self.cache
+                .put_metadata(
+                    identified.platform,
+                    identified.content_id.as_str(),
+                    &metadata,
+                    self.config.metadata_cache_ttl,
+                )
+                .await?;
+            self.fit_telegram(metadata.profiles)
+        };
+        if self.metadata.has_public_photos(&identified).await? {
+            profiles.insert(0, ProcessingProfile::best_image());
+        }
+        Ok(profiles)
+    }
+
+    /// Menu rows and the first send share one ceiling, so Best is the best file
+    /// Telegram can accept. The metadata cache itself stays uncapped.
+    fn fit_telegram(&self, profiles: Vec<ProcessingProfile>) -> Vec<ProcessingProfile> {
+        let limit = self.config.telegram_max_upload_bytes;
+        profiles.into_iter().map(|profile| profile.within(limit)).collect()
+    }
+
+    pub async fn silence_status_notice(&self, job_id: Uuid, user_id: Uuid) -> Result<(), AppError> {
+        self.store.silence_status_notice(job_id, user_id).await
+    }
+
+    pub async fn point_status_message(
+        &self,
+        job_id: Uuid,
+        user_id: Uuid,
+        message_id: i32,
+    ) -> Result<(), AppError> {
+        self.store.point_status_message(job_id, user_id, message_id).await
     }
 
     pub async fn resolve(&self, actor: &Actor, raw_url: &str) -> Result<ResolveView, AppError> {

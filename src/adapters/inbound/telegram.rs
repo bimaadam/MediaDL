@@ -9,17 +9,17 @@ use tokio::sync::watch;
 use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::*;
 use teloxide::types::{
-    CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia,
-    InputMediaPhoto, Message, MessageId,
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia,
+    InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo, Message, MessageId,
 };
 use teloxide::utils::command::BotCommands;
 use tokio_util::sync::CancellationToken;
 
 use crate::adapters::inbound::http::selection_token;
 use crate::application::{
-    AppError, Engine, FormatSelection, SubmitCommand, SubmitOutcome, TelegramChoice,
-    TelegramFileRef, download_status_text, format_menu_token, resolution_menu_choices,
-    root_menu_choices,
+    AppError, DeliveredFile, Engine, FormatSelection, SubmitCommand, SubmitOutcome, TelegramChoice,
+    TelegramFileRef, download_status_text, format_menu_token, messages_to_remove,
+    resolution_menu_choices, root_menu_choices,
 };
 use crate::domain::{
     Actor, Artifact, DeliveryChannel, JobStatus, MediaIdentity, ProcessingProfile, UserKind,
@@ -161,7 +161,8 @@ async fn fetch_link(
     url: &str,
 ) -> Result<(), AppError> {
     let actor = actor_for(engine, message).await?;
-    let pulse = begin_animation(bot, engine, actor.user_id, chat_id, AnimSignal::Spin).await?;
+    let (pulse, status_message) =
+        begin_animation(bot, engine, actor.user_id, chat_id, AnimSignal::Spin).await?;
     let submitted = async {
         let profile = engine.preferred_profile(url).await?;
         engine
@@ -186,8 +187,19 @@ async fn fetch_link(
             return Ok(());
         }
     };
-    match deliver_outcome(bot, engine, bot_id, chat_id, &actor, url, outcome).await {
-        Ok(follow) => apply_follow(bot, engine, actor.user_id, chat_id, Some(pulse), follow).await,
+    let target = DeliveryTarget {
+        bot_id,
+        chat_id,
+        actor: &actor,
+        url,
+        replace_message_id: None,
+        drop_message_ids: &[],
+    };
+    match deliver_outcome(bot, engine, &target, outcome).await {
+        Ok(follow) => {
+            apply_follow(bot, engine, actor.user_id, chat_id, Some((pulse, status_message)), follow)
+                .await
+        }
         Err(error) => {
             let _ = pulse.send(AnimSignal::Fail(status_failure(&error.to_string())));
             tracing::warn!(%error, "telegram delivery failed");
@@ -224,6 +236,7 @@ async fn handle_callback(
         return Err(AppError::Validation("unknown format choice".into()));
     };
     let actor = Actor { user_id: selection.user_id, kind: UserKind::Telegram };
+    let replace_message_id = query.message.as_ref().map(|message| message.id().0);
     let outcome = engine
         .submit(SubmitCommand {
             url: selection.url.clone(),
@@ -236,8 +249,15 @@ async fn handle_callback(
             },
         })
         .await?;
-    let follow =
-        deliver_outcome(bot, engine, bot_id, chat_id, &actor, &selection.url, outcome).await?;
+    let target = DeliveryTarget {
+        bot_id,
+        chat_id,
+        actor: &actor,
+        url: &selection.url,
+        replace_message_id,
+        drop_message_ids: &selection.drop_message_ids,
+    };
+    let follow = deliver_outcome(bot, engine, &target, outcome).await?;
     apply_follow(bot, engine, actor.user_id, chat_id, None, follow).await
 }
 
@@ -249,8 +269,21 @@ async fn show_menu(
     token: &str,
     root: bool,
 ) -> Result<(), AppError> {
-    authorize(engine, chat_id, query, token).await?;
-    let choices = if root { root_menu_choices(token) } else { resolution_menu_choices(token) };
+    let mut selection = authorize(engine, chat_id, query, token).await?;
+    if !root {
+        selection.profiles = match engine.available_profiles(&selection.url).await {
+            Ok(profiles) if !profiles.is_empty() => profiles,
+            _ => vec![
+                ProcessingProfile::best_video().within(engine.config().telegram_max_upload_bytes),
+            ],
+        };
+        engine.put_selection(token, &selection).await?;
+    }
+    let choices = if root {
+        root_menu_choices(token)
+    } else {
+        resolution_menu_choices(token, &selection.profiles)
+    };
     let Some(markup) = menu_markup(&choices) else {
         return Ok(());
     };
@@ -297,45 +330,80 @@ enum FollowUp {
     Tell(String),
 }
 
+struct DeliveryTarget<'a> {
+    bot_id: &'a str,
+    chat_id: i64,
+    actor: &'a Actor,
+    url: &'a str,
+    replace_message_id: Option<i32>,
+    drop_message_ids: &'a [i32],
+}
+
 async fn deliver_outcome(
     bot: &Bot,
     engine: &Arc<Engine>,
-    bot_id: &str,
-    chat_id: i64,
-    actor: &Actor,
-    url: &str,
+    target: &DeliveryTarget<'_>,
     outcome: SubmitOutcome,
 ) -> Result<FollowUp, AppError> {
     match outcome {
         SubmitOutcome::TelegramCached { file, identity } => {
             let token = selection_token();
-            remember_menu(engine, &token, actor, chat_id, url).await?;
-            if send_cached(bot, chat_id, &file, &root_menu_choices(&token)).await.is_err() {
-                engine.invalidate_telegram_file(bot_id, &identity, file.artifact_id).await?;
-                return Ok(FollowUp::Tell(
-                    "The cached Telegram file expired. Ask again to deliver it from storage."
-                        .to_owned(),
-                ));
+            remember_menu(engine, &token, target, None, Vec::new()).await?;
+            let choices = root_menu_choices(&token);
+            let sent = match target.replace_message_id {
+                Some(message_id) if file.kind != "album" => {
+                    match edit_file_id(bot, target.chat_id, message_id, &file, &choices).await {
+                        Ok(sent) => Ok(sent),
+                        Err(error) => {
+                            tracing::warn!(%error, "cached file did not replace the message");
+                            send_cached(bot, target.chat_id, &file, &choices).await
+                        }
+                    }
+                }
+                _ => send_cached(bot, target.chat_id, &file, &choices).await,
+            };
+            match sent {
+                Ok(sent) => {
+                    finish_replacement(bot, target, &sent.message_ids).await;
+                    stamp_messages(engine, &token, sent.message_ids).await?;
+                    Ok(FollowUp::Done)
+                }
+                Err(_) => {
+                    engine
+                        .invalidate_telegram_file(target.bot_id, &identity, file.artifact_id)
+                        .await?;
+                    Ok(FollowUp::Tell(
+                        "The cached Telegram file expired. Ask again to deliver it from storage."
+                            .to_owned(),
+                    ))
+                }
             }
-            Ok(FollowUp::Done)
         }
         SubmitOutcome::Ready { artifact, identity, .. } => {
             let token = selection_token();
-            remember_menu(engine, &token, actor, chat_id, url).await?;
-            deliver_ready(
+            remember_menu(engine, &token, target, None, Vec::new()).await?;
+            let sent = deliver_ready(
                 bot,
                 engine,
-                bot_id,
-                chat_id,
+                target,
                 &artifact,
                 &identity,
                 &root_menu_choices(&token),
             )
             .await?;
+            stamp_messages(engine, &token, sent).await?;
             Ok(FollowUp::Done)
         }
         SubmitOutcome::Queued { job_id, .. } => {
-            remember_menu(engine, &format_menu_token(job_id, chat_id), actor, chat_id, url).await?;
+            let token = format_menu_token(job_id, target.chat_id);
+            remember_menu(
+                engine,
+                &token,
+                target,
+                target.replace_message_id,
+                target.drop_message_ids.to_vec(),
+            )
+            .await?;
             Ok(FollowUp::Track(job_id))
         }
     }
@@ -346,28 +414,30 @@ async fn apply_follow(
     engine: &Arc<Engine>,
     user_id: uuid::Uuid,
     chat_id: i64,
-    pulse: Option<watch::Sender<AnimSignal>>,
+    pulse: Option<(watch::Sender<AnimSignal>, MessageId)>,
     follow: FollowUp,
 ) -> Result<(), AppError> {
     match follow {
         FollowUp::Done => {
-            if let Some(tx) = pulse {
+            if let Some((tx, _)) = pulse {
                 let _ = tx.send(AnimSignal::Clear);
             }
             Ok(())
         }
         FollowUp::Track(job_id) => {
-            if let Some(tx) = pulse {
-                let _ = tx.send(AnimSignal::Track(job_id));
-                Ok(())
-            } else {
-                begin_animation(bot, engine, user_id, chat_id, AnimSignal::Track(job_id))
-                    .await
-                    .map(|_| ())
-            }
+            let (tx, status_message) = match pulse {
+                Some(pair) => pair,
+                None => {
+                    begin_animation(bot, engine, user_id, chat_id, AnimSignal::Track(job_id))
+                        .await?
+                }
+            };
+            let _ = engine.point_status_message(job_id, user_id, status_message.0).await;
+            let _ = tx.send(AnimSignal::Track(job_id));
+            Ok(())
         }
         FollowUp::Tell(text) => {
-            if let Some(tx) = pulse {
+            if let Some((tx, _)) = pulse {
                 let _ = tx.send(AnimSignal::Fail(text));
                 Ok(())
             } else {
@@ -383,46 +453,70 @@ async fn apply_follow(
 async fn remember_menu(
     engine: &Engine,
     token: &str,
-    actor: &Actor,
-    chat_id: i64,
-    url: &str,
+    target: &DeliveryTarget<'_>,
+    replace_message_id: Option<i32>,
+    drop_message_ids: Vec<i32>,
 ) -> Result<(), AppError> {
     engine
         .put_selection(
             token,
             &FormatSelection {
-                url: url.to_owned(),
-                user_id: actor.user_id,
-                chat_id,
-                profiles: ProcessingProfile::format_menu(),
+                url: target.url.to_owned(),
+                user_id: target.actor.user_id,
+                chat_id: target.chat_id,
+                profiles: vec![
+                    ProcessingProfile::best_video()
+                        .within(engine.config().telegram_max_upload_bytes),
+                ],
+                replace_message_id,
+                drop_message_ids,
             },
         )
         .await
 }
 
+async fn stamp_messages(
+    engine: &Engine,
+    token: &str,
+    message_ids: Vec<i32>,
+) -> Result<(), AppError> {
+    let Some(mut selection) = engine.take_selection(token).await? else {
+        return Ok(());
+    };
+    selection.drop_message_ids = message_ids;
+    selection.replace_message_id = None;
+    engine.put_selection(token, &selection).await
+}
+
+async fn finish_replacement(bot: &Bot, target: &DeliveryTarget<'_>, kept: &[i32]) {
+    let Some(replaced) = target.replace_message_id else {
+        return;
+    };
+    let keep_replaced = kept.contains(&replaced);
+    for message_id in messages_to_remove(target.drop_message_ids, replaced, keep_replaced) {
+        let _ = bot.delete_message(ChatId(target.chat_id), MessageId(message_id)).await;
+    }
+}
+
 async fn deliver_ready(
     bot: &Bot,
     engine: &Engine,
-    bot_id: &str,
-    chat_id: i64,
+    target: &DeliveryTarget<'_>,
     artifact: &Artifact,
     identity: &MediaIdentity,
     choices: &[TelegramChoice],
-) -> Result<(), AppError> {
+) -> Result<Vec<i32>, AppError> {
     let kind = crate::application::delivery_kind(&artifact.content_type);
+    let chat_id = target.chat_id;
+    // An album is several messages. The archive can exceed one upload; each piece is capped later.
     if artifact.byte_size < 0
-        || artifact.byte_size as u64 > engine.config().telegram_max_upload_bytes
+        || (kind != "album"
+            && artifact.byte_size as u64 > engine.config().telegram_max_upload_bytes)
     {
-        bot.send_message(
-            ChatId(chat_id),
-            format!(
-                "This file is larger than Telegram accepts. Download it with your API key: GET /api/v1/artifacts/{}/content",
-                artifact.id
-            ),
-        )
-        .await
-        .map_err(|error| AppError::Dependency(error.to_string()))?;
-        return Ok(());
+        bot.send_message(ChatId(chat_id), crate::application::TELEGRAM_OVERSIZED)
+            .await
+            .map_err(|error| AppError::Dependency(error.to_string()))?;
+        return Ok(Vec::new());
     }
     let directory = engine.config().tmp_dir.join(format!("deliver-{}-{chat_id}", artifact.id));
     tokio::fs::create_dir_all(&directory)
@@ -439,12 +533,15 @@ async fn deliver_ready(
             .map_err(|error| AppError::Dependency(format!("copy artifact: {error}")))?;
         file.flush().await.map_err(|error| AppError::Dependency(error.to_string()))?;
         drop(file);
-        let mut stored = send_path(bot, chat_id, &path, kind, "", choices).await?;
+        let mut sent = match place_file(bot, target, &path, kind, choices).await {
+            Err(error) if error.is_oversized_notice() => return Ok(Vec::new()),
+            other => other?,
+        };
         if kind != "album" {
-            stored.artifact_id = artifact.id;
-            engine.remember_telegram_file(bot_id, identity, &stored).await?;
+            sent.file.artifact_id = artifact.id;
+            engine.remember_telegram_file(target.bot_id, identity, &sent.file).await?;
         }
-        Ok(())
+        Ok(sent.message_ids)
     }
     .await;
     let _ = tokio::fs::remove_dir_all(&directory).await;
@@ -456,9 +553,9 @@ async fn send_cached(
     chat_id: i64,
     file: &TelegramFileRef,
     choices: &[TelegramChoice],
-) -> Result<(), AppError> {
+) -> Result<DeliveredFile, AppError> {
     let filename = part_name(&file.kind, None);
-    send_input(
+    let message = send_input(
         bot,
         chat_id,
         InputFile::file_id(file.file_id.clone().into()),
@@ -467,8 +564,30 @@ async fn send_cached(
         "",
         choices,
     )
-    .await
-    .map(|_| ())
+    .await?;
+    Ok(DeliveredFile { message_ids: vec![message.id.0], file: file.clone() })
+}
+
+/// Edit the message the user already has. A failed edit sends once, then the old bubbles go away.
+async fn place_file(
+    bot: &Bot,
+    target: &DeliveryTarget<'_>,
+    path: &std::path::Path,
+    kind: &str,
+    choices: &[TelegramChoice],
+) -> Result<DeliveredFile, AppError> {
+    if let Some(message_id) = target.replace_message_id
+        && kind != "album"
+        && let Ok(sent) = edit_path(bot, target.chat_id, message_id, path, kind, choices).await
+    {
+        finish_replacement(bot, target, &sent.message_ids).await;
+        return Ok(sent);
+    }
+    let sent = send_path(bot, target.chat_id, path, kind, "", choices).await?;
+    if target.replace_message_id.is_some() {
+        finish_replacement(bot, target, &[]).await;
+    }
+    Ok(sent)
 }
 
 pub async fn send_path(
@@ -478,14 +597,57 @@ pub async fn send_path(
     kind: &str,
     caption: &str,
     choices: &[TelegramChoice],
-) -> Result<TelegramFileRef, AppError> {
+) -> Result<DeliveredFile, AppError> {
     if kind == "album" {
         return send_album(bot, chat_id, path, choices).await;
     }
     let filename = part_name(kind, Some(path));
     let message =
         send_input(bot, chat_id, InputFile::file(path), kind, &filename, caption, choices).await?;
-    file_ref(&message, kind)
+    Ok(DeliveredFile { file: file_ref(&message, kind)?, message_ids: vec![message.id.0] })
+}
+
+async fn edit_path(
+    bot: &Bot,
+    chat_id: i64,
+    message_id: i32,
+    path: &std::path::Path,
+    kind: &str,
+    choices: &[TelegramChoice],
+) -> Result<DeliveredFile, AppError> {
+    let filename = part_name(kind, Some(path));
+    let message = edit_input(
+        bot,
+        chat_id,
+        MessageId(message_id),
+        InputFile::file(path),
+        kind,
+        &filename,
+        choices,
+    )
+    .await?;
+    Ok(DeliveredFile { file: file_ref(&message, kind)?, message_ids: vec![message.id.0] })
+}
+
+async fn edit_file_id(
+    bot: &Bot,
+    chat_id: i64,
+    message_id: i32,
+    file: &TelegramFileRef,
+    choices: &[TelegramChoice],
+) -> Result<DeliveredFile, AppError> {
+    let filename = part_name(&file.kind, None);
+    let message = edit_input(
+        bot,
+        chat_id,
+        MessageId(message_id),
+        InputFile::file_id(file.file_id.clone().into()),
+        &file.kind,
+        &filename,
+        choices,
+    )
+    .await?;
+    Ok(DeliveredFile { message_ids: vec![message.id.0], file: file.clone() })
 }
 
 fn menu_markup(choices: &[TelegramChoice]) -> Option<InlineKeyboardMarkup> {
@@ -553,62 +715,57 @@ async fn send_album(
     chat_id: i64,
     path: &std::path::Path,
     choices: &[TelegramChoice],
-) -> Result<TelegramFileRef, AppError> {
+) -> Result<DeliveredFile, AppError> {
     let bytes =
         tokio::fs::read(path).await.map_err(|error| AppError::Dependency(error.to_string()))?;
-    let files = crate::shared::stored_zip::read_stored_zip(&bytes)?;
-    if files.is_empty() {
-        return Err(AppError::Validation("photo archive is empty".into()));
-    }
+    let stored = crate::shared::stored_zip::read_stored_zip(&bytes)?;
+    let files = match fitting_pieces(stored, crate::application::TELEGRAM_FILE_BYTES) {
+        Ok(files) => files,
+        Err(error) if error.is_oversized_notice() => {
+            bot.send_message(ChatId(chat_id), crate::application::TELEGRAM_OVERSIZED)
+                .await
+                .map_err(|error| AppError::Dependency(error.to_string()))?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     if files.len() == 1 {
-        let filename = part_name("photo", None);
-        let message = send_input(
-            bot,
-            chat_id,
-            InputFile::memory(files[0].1.clone()),
-            "photo",
-            &filename,
-            "",
-            choices,
-        )
-        .await?;
-        return file_ref(&message, "album");
+        let (name, data) = files
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Validation("photo archive is empty".into()))?;
+        let kind = piece_kind(&name);
+        let message =
+            send_input(bot, chat_id, InputFile::memory(data), kind, &name, "", choices).await?;
+        return Ok(DeliveredFile {
+            file: file_ref(&message, kind)?,
+            message_ids: vec![message.id.0],
+        });
     }
     let mut first = None;
-    for (chunk_index, chunk) in files.chunks(10).enumerate() {
-        let Some(data) = chunk.first() else {
+    let mut message_ids = Vec::new();
+    for chunk in files.chunks(10) {
+        let Some((name, data)) = chunk.first() else {
             continue;
         };
         if chunk.len() < 2 {
-            let filename = part_name("photo", None);
-            let message = send_input(
-                bot,
-                chat_id,
-                InputFile::memory(data.1.clone()),
-                "photo",
-                &filename,
-                "",
-                &[],
-            )
-            .await?;
+            let kind = piece_kind(name);
+            let message =
+                send_input(bot, chat_id, InputFile::memory(data.clone()), kind, name, "", &[])
+                    .await?;
+            message_ids.push(message.id.0);
             if first.is_none() {
-                first = Some(file_ref(&message, "album")?);
+                first = Some(file_ref(&message, kind)?);
             }
             continue;
         }
-        let media = chunk
-            .iter()
-            .enumerate()
-            .map(|(index, (_, data))| {
-                let file =
-                    InputFile::memory(data.clone()).file_name(album_name(chunk_index * 10 + index));
-                InputMedia::Photo(InputMediaPhoto::new(file))
-            })
-            .collect::<Vec<_>>();
+        let media =
+            chunk.iter().map(|(name, data)| album_input(name, data.clone())).collect::<Vec<_>>();
         let messages = bot
             .send_media_group(ChatId(chat_id), media)
             .await
             .map_err(|error| AppError::Dependency(error.to_string()))?;
+        message_ids.extend(messages.iter().map(|message| message.id.0));
         if first.is_none() {
             let message = messages
                 .first()
@@ -617,12 +774,67 @@ async fn send_album(
         }
     }
     // A media group cannot carry an inline keyboard. The menu is the next message.
-    if let Some(markup) = menu_markup(choices)
-        && let Err(error) = bot.send_message(ChatId(chat_id), "Media").reply_markup(markup).await
-    {
-        tracing::warn!(%error, "album menu was not attached");
+    if let Some(markup) = menu_markup(choices) {
+        match bot.send_message(ChatId(chat_id), "Media").reply_markup(markup).await {
+            Ok(message) => message_ids.push(message.id.0),
+            Err(error) => tracing::warn!(%error, "album menu was not attached"),
+        }
     }
-    first.ok_or_else(|| AppError::Validation("photo archive is empty".into()))
+    let file = first.ok_or_else(|| AppError::Validation("photo archive is empty".into()))?;
+    Ok(DeliveredFile { file, message_ids })
+}
+
+fn fitting_pieces(
+    files: Vec<(String, Vec<u8>)>,
+    limit: u64,
+) -> Result<Vec<(String, Vec<u8>)>, AppError> {
+    if files.is_empty() {
+        return Err(AppError::Validation("photo archive is empty".into()));
+    }
+    let fit = files.into_iter().filter(|(_, data)| data.len() as u64 <= limit).collect::<Vec<_>>();
+    if fit.is_empty() {
+        Err(AppError::Validation(crate::application::TELEGRAM_OVERSIZED.into()))
+    } else {
+        Ok(fit)
+    }
+}
+
+fn album_input(name: &str, data: Vec<u8>) -> InputMedia {
+    let file = InputFile::memory(data).file_name(name.to_owned());
+    if piece_kind(name) == "video" {
+        InputMedia::Video(InputMediaVideo::new(file).supports_streaming(true))
+    } else {
+        InputMedia::Photo(InputMediaPhoto::new(file))
+    }
+}
+
+fn piece_kind(name: &str) -> &'static str {
+    if name.rsplit('.').next() == Some("mp4") { "video" } else { "photo" }
+}
+
+async fn edit_input(
+    bot: &Bot,
+    chat_id: i64,
+    message_id: MessageId,
+    input: InputFile,
+    kind: &str,
+    filename: &str,
+    choices: &[TelegramChoice],
+) -> Result<Message, AppError> {
+    let name = if filename.is_empty() { upload_name(kind) } else { filename };
+    let input = input.file_name(name.to_owned());
+    let media = match kind {
+        "audio" => InputMedia::Audio(InputMediaAudio::new(input)),
+        "photo" => InputMedia::Photo(InputMediaPhoto::new(input)),
+        "video" => InputMedia::Video(InputMediaVideo::new(input).supports_streaming(true)),
+        _ => InputMedia::Document(InputMediaDocument::new(input)),
+    };
+    let request = bot.edit_message_media(ChatId(chat_id), message_id, media);
+    match menu_markup(choices) {
+        Some(markup) => request.reply_markup(markup).await,
+        None => request.await,
+    }
+    .map_err(|error| AppError::Dependency(error.to_string()))
 }
 
 fn file_ref(message: &Message, kind: &str) -> Result<TelegramFileRef, AppError> {
@@ -688,7 +900,7 @@ impl crate::application::TelegramSender for TeloxideSender {
         kind: &str,
         caption: &str,
     ) -> Result<TelegramFileRef, AppError> {
-        send_path(&self.bot, chat_id, path, kind, caption, &[]).await
+        send_path(&self.bot, chat_id, path, kind, caption, &[]).await.map(|sent| sent.file)
     }
 
     async fn send_file_id(
@@ -719,7 +931,7 @@ impl crate::application::TelegramSender for TeloxideSender {
         kind: &str,
         caption: &str,
         choices: &[TelegramChoice],
-    ) -> Result<TelegramFileRef, AppError> {
+    ) -> Result<DeliveredFile, AppError> {
         send_path(&self.bot, chat_id, path, kind, caption, choices).await
     }
 
@@ -730,9 +942,9 @@ impl crate::application::TelegramSender for TeloxideSender {
         file_id: &str,
         caption: &str,
         choices: &[TelegramChoice],
-    ) -> Result<(), AppError> {
+    ) -> Result<DeliveredFile, AppError> {
         let filename = part_name(kind, None);
-        send_input(
+        let message = send_input(
             &self.bot,
             chat_id,
             InputFile::file_id(file_id.to_owned().into()),
@@ -741,16 +953,58 @@ impl crate::application::TelegramSender for TeloxideSender {
             caption,
             choices,
         )
-        .await
-        .map(|_| ())
+        .await?;
+        Ok(DeliveredFile { file: file_ref(&message, kind)?, message_ids: vec![message.id.0] })
     }
 
-    async fn edit_text(&self, chat_id: i64, message_id: i32, text: &str) -> Result<(), AppError> {
+    async fn edit_file_menu(
+        &self,
+        chat_id: i64,
+        message_id: i32,
+        path: &std::path::Path,
+        kind: &str,
+        choices: &[TelegramChoice],
+    ) -> Result<DeliveredFile, AppError> {
+        edit_path(&self.bot, chat_id, message_id, path, kind, choices).await
+    }
+
+    async fn edit_file_id_menu(
+        &self,
+        chat_id: i64,
+        message_id: i32,
+        kind: &str,
+        file_id: &str,
+        choices: &[TelegramChoice],
+    ) -> Result<DeliveredFile, AppError> {
+        edit_file_id(
+            &self.bot,
+            chat_id,
+            message_id,
+            &TelegramFileRef {
+                file_id: file_id.to_owned(),
+                file_unique_id: None,
+                kind: kind.to_owned(),
+                artifact_id: uuid::Uuid::nil(),
+            },
+            choices,
+        )
+        .await
+    }
+
+    async fn delete_message(&self, chat_id: i64, message_id: i32) -> Result<(), AppError> {
         self.bot
-            .edit_message_text(ChatId(chat_id), MessageId(message_id), text)
+            .delete_message(ChatId(chat_id), MessageId(message_id))
             .await
             .map(|_| ())
             .map_err(|error| AppError::Dependency(error.to_string()))
+    }
+
+    async fn edit_text(&self, chat_id: i64, message_id: i32, text: &str) -> Result<(), AppError> {
+        match self.bot.edit_message_text(ChatId(chat_id), MessageId(message_id), text).await {
+            Ok(_) => Ok(()),
+            Err(error) if unchanged_message(&error.to_string()) => Ok(()),
+            Err(error) => Err(AppError::Dependency(error.to_string())),
+        }
     }
 }
 
@@ -767,7 +1021,6 @@ enum AnimSignal {
 }
 
 const FRAME: Duration = Duration::from_millis(900);
-const ACTION_EVERY: Duration = Duration::from_secs(4);
 const ANIMATION_CAP: Duration = Duration::from_secs(12 * 60);
 
 async fn begin_animation(
@@ -776,19 +1029,19 @@ async fn begin_animation(
     user_id: uuid::Uuid,
     chat_id: i64,
     initial: AnimSignal,
-) -> Result<watch::Sender<AnimSignal>, AppError> {
+) -> Result<(watch::Sender<AnimSignal>, MessageId), AppError> {
     let status = bot
         .send_message(ChatId(chat_id), download_status_text(0, None))
         .await
         .map_err(|error| AppError::Dependency(error.to_string()))?;
-    let _ = bot.send_chat_action(ChatId(chat_id), ChatAction::UploadDocument).await;
     let (tx, rx) = watch::channel(initial);
     let bot = bot.clone();
     let engine = Arc::clone(engine);
+    let message_id = status.id;
     tokio::spawn(async move {
-        animate(bot, engine, user_id, chat_id, status.id, rx).await;
+        animate(bot, engine, user_id, chat_id, message_id, rx).await;
     });
-    Ok(tx)
+    Ok((tx, message_id))
 }
 
 async fn animate(
@@ -801,8 +1054,8 @@ async fn animate(
 ) {
     let started = Instant::now();
     let mut tick = 1u32;
-    let mut last_action = Instant::now();
     let mut misses = 0u8;
+    let mut quiet = false;
     let mut sender_open = true;
     loop {
         let signal = rx.borrow().clone();
@@ -828,36 +1081,46 @@ async fn animate(
                 return;
             }
             AnimSignal::Spin => {
-                misses = note_paint(paint(&bot, chat_id, message_id, tick, None).await, misses);
+                if !quiet {
+                    misses = note_paint(paint(&bot, chat_id, message_id, tick, None).await, misses);
+                    quiet = misses >= 3;
+                }
             }
             AnimSignal::Track(job_id) => match engine.job_for_user(user_id, job_id).await {
                 Ok(job) if job.status.is_terminal() => {
                     if job.status == JobStatus::Completed {
                         dismiss_status(&bot, chat_id, message_id).await;
                     } else {
+                        let _ = engine.silence_status_notice(job_id, user_id).await;
                         let text = job_terminal_text(job.status, job.failure_reason.as_deref());
                         let _ = edit_status(&bot, chat_id, message_id, &text).await;
                     }
                     return;
                 }
                 Ok(_) => {
-                    let percent =
-                        engine.progress(job_id).await.ok().flatten().and_then(|item| item.percent);
-                    misses =
-                        note_paint(paint(&bot, chat_id, message_id, tick, percent).await, misses);
+                    if !quiet {
+                        let percent = engine
+                            .progress(job_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|item| item.percent);
+                        misses = note_paint(
+                            paint(&bot, chat_id, message_id, tick, percent).await,
+                            misses,
+                        );
+                        quiet = misses >= 3;
+                    }
                 }
                 Err(error) => {
                     tracing::debug!(%error, "download status poll failed");
-                    misses = note_paint(paint(&bot, chat_id, message_id, tick, None).await, misses);
+                    if !quiet {
+                        misses =
+                            note_paint(paint(&bot, chat_id, message_id, tick, None).await, misses);
+                        quiet = misses >= 3;
+                    }
                 }
             },
-        }
-        if misses >= 3 {
-            return;
-        }
-        if last_action.elapsed() >= ACTION_EVERY {
-            let _ = bot.send_chat_action(ChatId(chat_id), ChatAction::UploadDocument).await;
-            last_action = Instant::now();
         }
         tick = tick.wrapping_add(1);
         if sender_open {
@@ -926,10 +1189,6 @@ fn upload_name(kind: &str) -> &'static str {
     }
 }
 
-fn album_name(index: usize) -> String {
-    format!("{:02}.jpg", index + 1)
-}
-
 fn unchanged_message(error: &str) -> bool {
     error.to_ascii_lowercase().contains("message is not modified")
 }
@@ -984,8 +1243,25 @@ mod tests {
         assert_eq!(upload_name("photo"), "photo.jpg");
         assert_eq!(upload_name("video"), "video.mp4");
         assert_eq!(upload_name("audio"), "audio.mp3");
-        assert_eq!(album_name(0), "01.jpg");
-        assert_eq!(album_name(9), "10.jpg");
+        assert_eq!(piece_kind("01.jpg"), "photo");
+        assert_eq!(piece_kind("02.mp4"), "video");
+        assert_eq!(piece_kind("10.jpg"), "photo");
+    }
+
+    #[test]
+    fn album_drops_a_piece_telegram_cannot_accept() {
+        let photo = vec![0xFF, 0xD8, 0xFF];
+        let video = vec![0, 0, 0, 0x18, b'f', b't', b'y', b'p'];
+        let kept = fitting_pieces(
+            vec![("01.jpg".into(), photo.clone()), ("02.mp4".into(), video.clone())],
+            4,
+        )
+        .expect("pieces");
+        assert_eq!(kept, vec![("01.jpg".into(), photo)]);
+        let oversized = fitting_pieces(vec![("01.mp4".into(), video)], 4).expect_err("too big");
+        assert!(oversized.is_oversized_notice());
+        let empty = fitting_pieces(Vec::new(), 4).expect_err("empty");
+        assert!(!empty.is_oversized_notice());
     }
 
     #[test]

@@ -58,7 +58,7 @@ impl Default for RuntimeConfig {
             retry_cap: Duration::from_secs(300),
             rate_limit_per_minute: 20,
             daily_quota: 100,
-            telegram_max_upload_bytes: 50 * 1024 * 1024,
+            telegram_max_upload_bytes: TELEGRAM_FILE_BYTES,
             multipart_threshold_bytes: 64 * 1024 * 1024,
             job_expiry: Duration::from_secs(24 * 3600),
             uploading_grace: Duration::from_secs(2 * 3600),
@@ -234,6 +234,14 @@ pub fn delivery_kind(content_type: &str) -> &'static str {
     }
 }
 
+/// Shown when a stored file is still over Telegram's upload limit.
+/// The chat does not get an API content URL.
+pub const TELEGRAM_OVERSIZED: &str = "This video is too large for Telegram. Choose a smaller size.";
+
+/// One Telegram `sendPhoto` / `sendVideo` / media-group item. Bot API rejects
+/// a larger upload. An album archive may be bigger because each item is sent alone.
+pub const TELEGRAM_FILE_BYTES: u64 = 50 * 1024 * 1024;
+
 /// Multipart name Telegram clients render. Never `media.bin`: phones use this
 /// name, and an unrecognized extension shows up as a file instead of a photo.
 pub fn upload_filename(content_type: &str) -> &'static str {
@@ -274,9 +282,16 @@ pub fn root_menu_choices(token: &str) -> Vec<TelegramChoice> {
     vec![TelegramChoice { label: "Menu".to_owned(), data: format!("m:{token}") }]
 }
 
-/// Resolution list plus the control that returns to [`root_menu_choices`].
-pub fn resolution_menu_choices(token: &str) -> Vec<TelegramChoice> {
-    let mut choices = format_menu_choices(token);
+/// Rows for the profiles the platform actually published, plus Back.
+pub fn resolution_menu_choices(token: &str, profiles: &[ProcessingProfile]) -> Vec<TelegramChoice> {
+    let mut choices = profiles
+        .iter()
+        .enumerate()
+        .map(|(index, profile)| TelegramChoice {
+            label: profile.menu_label(),
+            data: format!("s:{token}:{index}"),
+        })
+        .collect::<Vec<_>>();
     choices.push(TelegramChoice { label: "Back".to_owned(), data: format!("b:{token}") });
     choices
 }
@@ -328,14 +343,20 @@ mod tests {
         assert_eq!(root[0].label, "Menu");
         assert!(root[0].data.len() <= 64, "{}", root[0].data);
         assert!(root[0].data.starts_with("m:"));
-        let opened = resolution_menu_choices(&token);
+        let published = vec![
+            ProcessingProfile::best_video(),
+            ProcessingProfile::video_mp4(576).expect("height"),
+            ProcessingProfile::audio_mp3(),
+        ];
+        let opened = resolution_menu_choices(&token, &published);
         let opened_labels: Vec<_> = opened.iter().map(|choice| choice.label.as_str()).collect();
-        assert_eq!(opened_labels, ["Best", "360p", "480p", "720p", "1080p", "Audio", "Back"]);
-        assert_eq!(opened.len(), 7);
+        assert_eq!(opened_labels, ["Best", "576p", "Audio", "Back"]);
+        assert!(!opened_labels.contains(&"360p"));
+        assert_eq!(opened.len(), 4);
         for choice in &opened {
             assert!(choice.data.len() <= 64, "{}", choice.data);
         }
-        assert!(opened[6].data.starts_with("b:"));
+        assert!(opened[3].data.starts_with("b:"));
     }
 
     #[test]
@@ -373,6 +394,14 @@ mod tests {
         assert_eq!(upload_filename("image/jpeg"), "photo.jpg");
         assert_eq!(upload_filename("application/zip"), "album.zip");
     }
+
+    #[test]
+    fn replacement_removes_the_old_bubbles_only() {
+        assert_eq!(messages_to_remove(&[10, 11, 12], 11, true), vec![10, 12]);
+        assert_eq!(messages_to_remove(&[11], 11, true), Vec::<i32>::new());
+        assert_eq!(messages_to_remove(&[4, 5], 5, false), vec![4, 5]);
+        assert_eq!(messages_to_remove(&[], 9, true), Vec::<i32>::new());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -381,6 +410,30 @@ pub struct FormatSelection {
     pub user_id: Uuid,
     pub chat_id: i64,
     pub profiles: Vec<ProcessingProfile>,
+    /// Message a resolution change edits. Empty for the first send.
+    #[serde(default)]
+    pub replace_message_id: Option<i32>,
+    /// Bubbles from the previous delivery. A replacement deletes these.
+    #[serde(default)]
+    pub drop_message_ids: Vec<i32>,
+}
+
+/// Bubbles to delete after a resolution change.
+/// Keeping the edited message stops the new file from becoming a second post.
+pub fn messages_to_remove(previous: &[i32], replaced: i32, keep_replaced: bool) -> Vec<i32> {
+    let mut ids: Vec<i32> = previous.iter().copied().filter(|id| *id != replaced).collect();
+    if !keep_replaced {
+        ids.push(replaced);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+#[derive(Debug, Clone)]
+pub struct DeliveredFile {
+    pub file: TelegramFileRef,
+    pub message_ids: Vec<i32>,
 }
 
 #[derive(Debug, Clone)]

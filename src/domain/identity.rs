@@ -137,7 +137,7 @@ impl MediaIdentity {
     }
 
     pub fn metadata_key(&self) -> String {
-        format!("meta:{}:{}", self.platform.code(), self.content_id.as_str())
+        metadata_cache_key(self.platform, self.content_id.as_str())
     }
 
     pub fn telegram_key(&self, bot_id: &str) -> String {
@@ -153,6 +153,11 @@ impl MediaIdentity {
             self.profile_hash.as_str()
         )
     }
+}
+
+/// Redis key for platform format metadata. `v2` drops menus that stored a fixed ladder.
+pub fn metadata_cache_key(platform: PlatformKind, content_id: &str) -> String {
+    format!("meta:v2:{}:{content_id}", platform.code())
 }
 
 /// Used by tests and direct-url identity. Not a general encoding helper.
@@ -211,11 +216,20 @@ mod tests {
             kind: MediaKind::Audio,
             quality: Quality::Best,
             container: Container::Mp3,
+            max_bytes: None,
         };
         let first = ProfileHash::from_profile(&profile).unwrap();
         let second = ProfileHash::from_profile(&profile).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.as_str().len(), 64);
+        let capped = ProcessingProfile::best_video().within(50 * 1024 * 1024);
+        let uncapped = ProcessingProfile::best_video();
+        assert_ne!(
+            ProfileHash::from_profile(&capped).unwrap(),
+            ProfileHash::from_profile(&uncapped).unwrap()
+        );
+        assert_eq!(uncapped.quality_label(), "best");
+        assert_eq!(capped.quality_label(), format!("best:{}", 50 * 1024 * 1024));
     }
 
     #[test]
@@ -235,5 +249,18 @@ mod tests {
         let key = identity.telegram_key("8242944978");
         assert!(key.starts_with("telegram:v2:8242944978:"));
         assert!(!key.starts_with("telegram:8242944978:"));
+    }
+
+    #[test]
+    fn metadata_cache_key_ignores_the_fixed_ladder_generation() {
+        let identity = MediaIdentity::derive(
+            PlatformKind::TikTok,
+            ContentId::new("7123456789012345678").unwrap(),
+            &ProcessingProfile::best_video(),
+        )
+        .unwrap();
+        let key = identity.metadata_key();
+        assert_eq!(key, "meta:v2:tiktok:7123456789012345678");
+        assert!(!key.starts_with("meta:tiktok:"));
     }
 }

@@ -2,8 +2,13 @@
 
 use crate::application::AppError;
 
-const MAX_ENTRIES: usize = 10;
-const MAX_UNCOMPRESSED: u64 = 64 * 1024 * 1024;
+/// One Telegram media group holds 10 items. Two groups cover a swipeable post.
+pub const ALBUM_MAX_FILES: usize = 20;
+/// Several short videos are sent as separate messages, so the archive can be
+/// larger than one Telegram upload.
+pub const ALBUM_MAX_BYTES: u64 = 200 * 1024 * 1024;
+const MAX_ENTRIES: usize = ALBUM_MAX_FILES;
+const MAX_UNCOMPRESSED: u64 = ALBUM_MAX_BYTES;
 
 pub fn write_stored_zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, AppError> {
     if files.is_empty() || files.len() > MAX_ENTRIES {
@@ -121,8 +126,8 @@ pub fn read_stored_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, AppError>
             return Err(AppError::TooLarge);
         }
         let data = bytes[data_at..data_end].to_vec();
-        if data.len() < 3 || data[0] != 0xFF || data[1] != 0xD8 || data[2] != 0xFF {
-            return Err(AppError::Validation("photo archive contains a non-jpeg".into()));
+        if !album_bytes_match(name, &data) {
+            return Err(AppError::Validation("album file is not a photo or video".into()));
         }
         files.push((name.to_owned(), data));
         cursor = data_end;
@@ -131,6 +136,14 @@ pub fn read_stored_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, AppError>
         return Err(AppError::Validation("photo archive is empty".into()));
     }
     Ok(files)
+}
+
+fn album_bytes_match(name: &str, data: &[u8]) -> bool {
+    match name.rsplit('.').next() {
+        Some("jpg") => data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF,
+        Some("mp4") => data.len() >= 12 && &data[4..8] == b"ftyp",
+        _ => false,
+    }
 }
 
 fn valid_name(name: &str) -> bool {
@@ -173,5 +186,18 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].1, first);
         assert_eq!(files[1].1, second);
+    }
+
+    #[test]
+    fn stored_zip_round_trips_a_photo_and_a_video() {
+        let photo = vec![0xFF, 0xD8, 0xFF, 0xD9];
+        let mut video = vec![0, 0, 0, 0x18];
+        video.extend_from_slice(b"ftypisom");
+        let bytes =
+            write_stored_zip(&[("01.jpg".into(), photo.clone()), ("02.mp4".into(), video.clone())])
+                .expect("zip");
+        let files = read_stored_zip(&bytes).expect("read");
+        assert_eq!(files[0], ("01.jpg".to_owned(), photo));
+        assert_eq!(files[1], ("02.mp4".to_owned(), video));
     }
 }

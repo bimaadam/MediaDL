@@ -16,7 +16,7 @@ use crate::application::{
     Admission, AppError, Cache, FormatSelection, JobProgress, JobQueue, Locks, MediaMetadata,
     QueueDelivery, QueueMessage, TelegramFileRef,
 };
-use crate::domain::{CachedArtifact, MediaIdentity, PlatformKind};
+use crate::domain::{CachedArtifact, MediaIdentity, PlatformKind, metadata_cache_key};
 
 const ACQUIRE: &str = "return redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2])";
 const RENEW: &str = r#"
@@ -164,7 +164,7 @@ impl Cache for RedisAdapter {
         platform: PlatformKind,
         content_id: &str,
     ) -> Result<Option<MediaMetadata>, AppError> {
-        self.get_json(&format!("meta:{platform}:{content_id}", platform = platform.code())).await
+        self.get_json(&metadata_cache_key(platform, content_id)).await
     }
 
     async fn put_metadata(
@@ -174,7 +174,7 @@ impl Cache for RedisAdapter {
         meta: &MediaMetadata,
         ttl: Duration,
     ) -> Result<(), AppError> {
-        self.put_json(&format!("meta:{}:{content_id}", platform.code()), meta, ttl).await
+        self.put_json(&metadata_cache_key(platform, content_id), meta, ttl).await
     }
 
     async fn get_telegram_file(

@@ -35,6 +35,12 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// The chat already received [`super::model::TELEGRAM_OVERSIZED`]. Callers
+    /// treat this as delivered so the sentence is not sent again on retry.
+    pub fn is_oversized_notice(&self) -> bool {
+        matches!(self, Self::Validation(text) if text == super::model::TELEGRAM_OVERSIZED)
+    }
+
     pub fn code(&self) -> &'static str {
         match self {
             Self::Domain(

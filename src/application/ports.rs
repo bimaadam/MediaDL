@@ -98,6 +98,19 @@ pub trait Store: Send + Sync {
         Ok(Vec::new())
     }
     async fn mark_notified(&self, subscription_id: Uuid, status: &str) -> Result<(), AppError>;
+    /// The chat animation already told the user. Skip the second status message.
+    async fn silence_status_notice(&self, _job_id: Uuid, _user_id: Uuid) -> Result<(), AppError> {
+        Ok(())
+    }
+    /// Point a failure notice at the downloading message so it is edited, not sent again.
+    async fn point_status_message(
+        &self,
+        _job_id: Uuid,
+        _user_id: Uuid,
+        _message_id: i32,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
     async fn save_telegram_delivery(
         &self,
         bot_id: &str,
@@ -339,9 +352,10 @@ pub trait TelegramSender: Send + Sync {
         kind: &str,
         caption: &str,
         choices: &[TelegramChoice],
-    ) -> Result<TelegramFileRef, AppError> {
+    ) -> Result<DeliveredFile, AppError> {
+        let file = self.send_file(chat_id, path, kind, caption).await?;
         let _ = choices;
-        self.send_file(chat_id, path, kind, caption).await
+        Ok(DeliveredFile { message_ids: Vec::new(), file })
     }
     async fn send_file_id_menu(
         &self,
@@ -350,9 +364,44 @@ pub trait TelegramSender: Send + Sync {
         file_id: &str,
         caption: &str,
         choices: &[TelegramChoice],
-    ) -> Result<(), AppError> {
+    ) -> Result<DeliveredFile, AppError> {
+        self.send_file_id(chat_id, kind, file_id, caption).await?;
         let _ = choices;
-        self.send_file_id(chat_id, kind, file_id, caption).await
+        Ok(DeliveredFile {
+            file: TelegramFileRef {
+                file_id: file_id.to_owned(),
+                file_unique_id: None,
+                kind: kind.to_owned(),
+                artifact_id: uuid::Uuid::nil(),
+            },
+            message_ids: Vec::new(),
+        })
+    }
+    async fn edit_file_menu(
+        &self,
+        chat_id: i64,
+        message_id: i32,
+        path: &Path,
+        kind: &str,
+        choices: &[TelegramChoice],
+    ) -> Result<DeliveredFile, AppError> {
+        let _ = (chat_id, message_id, path, kind, choices);
+        Err(AppError::Dependency("this sender cannot edit a message".into()))
+    }
+    async fn edit_file_id_menu(
+        &self,
+        chat_id: i64,
+        message_id: i32,
+        kind: &str,
+        file_id: &str,
+        choices: &[TelegramChoice],
+    ) -> Result<DeliveredFile, AppError> {
+        let _ = (chat_id, message_id, kind, file_id, choices);
+        Err(AppError::Dependency("this sender cannot edit a message".into()))
+    }
+    async fn delete_message(&self, chat_id: i64, message_id: i32) -> Result<(), AppError> {
+        let _ = (chat_id, message_id);
+        Ok(())
     }
     async fn edit_text(&self, chat_id: i64, message_id: i32, text: &str) -> Result<(), AppError>;
 }

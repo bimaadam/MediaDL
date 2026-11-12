@@ -716,6 +716,35 @@ impl Store for PostgresStore {
                 recovered.push(id);
             }
         }
+        // A retry publishes its queue message immediately, then the worker acks it
+        // because next_attempt_at is still in the future. Republish once it is due.
+        let due: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT j.id
+            FROM download_jobs j
+            WHERE j.status = 'queued'
+              AND j.locked_by IS NULL
+              AND j.next_attempt_at IS NOT NULL
+              AND j.next_attempt_at <= now()
+              AND NOT EXISTS (
+                  SELECT 1 FROM outbox_events o
+                  WHERE o.aggregate_id = j.id
+                    AND o.event_type = 'job.queued'
+                    AND o.published_at IS NULL
+              )
+            ORDER BY j.next_attempt_at
+            LIMIT $1
+            FOR UPDATE OF j SKIP LOCKED
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        for (id,) in due {
+            insert_outbox(&mut tx, id, "job.queued").await?;
+            recovered.push(id);
+        }
         tx.commit().await.map_err(db_err)?;
         Ok(recovered)
     }
@@ -1094,7 +1123,12 @@ impl Store for PostgresStore {
     async fn pending_status_notices(&self, limit: i64) -> Result<Vec<StatusNotice>, AppError> {
         let rows = sqlx::query_as::<_, (Uuid, i64, Option<i32>, String)>(
             r#"
-            SELECT s.id, s.telegram_chat_id, s.telegram_message_id, j.status
+            SELECT s.id, s.telegram_chat_id, s.telegram_message_id,
+                   CASE j.status
+                       WHEN 'cancelled' THEN 'Download cancelled.'
+                       WHEN 'expired' THEN 'Download expired.'
+                       ELSE COALESCE(NULLIF(btrim(j.failure_reason), ''), 'Download failed.')
+                   END
             FROM job_subscriptions s
             JOIN download_jobs j ON j.id = s.job_id
             WHERE s.channel = 'telegram' AND s.notify_status = 'pending'
@@ -1109,13 +1143,51 @@ impl Store for PostgresStore {
         .map_err(db_err)?;
         Ok(rows
             .into_iter()
-            .map(|(subscription_id, chat_id, message_id, status)| StatusNotice {
+            .map(|(subscription_id, chat_id, message_id, text)| StatusNotice {
                 subscription_id,
                 chat_id,
                 message_id,
-                text: format!("Download {status}."),
+                text,
             })
             .collect())
+    }
+
+    async fn silence_status_notice(&self, job_id: Uuid, user_id: Uuid) -> Result<(), AppError> {
+        sqlx::query(
+            r#"
+            UPDATE job_subscriptions
+            SET notify_status = 'sent'
+            WHERE job_id = $1 AND user_id = $2 AND channel = 'telegram' AND notify_status = 'pending'
+            "#,
+        )
+        .bind(job_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn point_status_message(
+        &self,
+        job_id: Uuid,
+        user_id: Uuid,
+        message_id: i32,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            r#"
+            UPDATE job_subscriptions
+            SET telegram_message_id = $3
+            WHERE job_id = $1 AND user_id = $2 AND channel = 'telegram' AND notify_status = 'pending'
+            "#,
+        )
+        .bind(job_id)
+        .bind(user_id)
+        .bind(message_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
     }
 
     async fn mark_notified(&self, subscription_id: Uuid, status: &str) -> Result<(), AppError> {

@@ -13,11 +13,14 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::application::{JobQueue, ObjectStorage, Pipeline, RuntimeConfig, Store, TelegramSender};
+use crate::application::{
+    Cache, JobQueue, ObjectStorage, Pipeline, RuntimeConfig, Store, TelegramSender,
+};
 
 pub struct WorkerSet {
     pub store: Arc<dyn Store>,
     pub queue: Arc<dyn JobQueue>,
+    pub cache: Arc<dyn Cache>,
     pub pipeline: Arc<Pipeline>,
     pub storage: Arc<dyn ObjectStorage>,
     pub sender: Option<Arc<dyn TelegramSender>>,
@@ -26,7 +29,7 @@ pub struct WorkerSet {
 }
 
 pub async fn run(set: WorkerSet, cancel: CancellationToken) {
-    let WorkerSet { store, queue, pipeline, storage, sender, config, worker_id } = set;
+    let WorkerSet { store, queue, cache, pipeline, storage, sender, config, worker_id } = set;
     let deps = Arc::new(WorkerDeps {
         store: Arc::clone(&store),
         queue: Arc::clone(&queue),
@@ -52,7 +55,7 @@ pub async fn run(set: WorkerSet, cancel: CancellationToken) {
             worker_id.clone(),
             cancel.clone()
         ),
-        loop_notify(store, storage, sender, config, worker_id, cancel),
+        loop_notify(store, cache, storage, sender, config, worker_id, cancel),
     );
 }
 
@@ -118,6 +121,7 @@ async fn loop_cleanup(
 
 async fn loop_notify(
     store: Arc<dyn Store>,
+    cache: Arc<dyn Cache>,
     storage: Arc<dyn ObjectStorage>,
     sender: Option<Arc<dyn TelegramSender>>,
     config: Arc<RuntimeConfig>,
@@ -129,7 +133,8 @@ async fn loop_notify(
     };
     while !cancel.is_cancelled() {
         if let Err(error) =
-            notify_once(store.as_ref(), storage.as_ref(), sender.as_ref(), &config).await
+            notify_once(store.as_ref(), cache.as_ref(), storage.as_ref(), sender.as_ref(), &config)
+                .await
         {
             tracing::warn!(%error, "notification delivery failed");
         }

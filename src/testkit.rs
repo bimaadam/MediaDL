@@ -24,7 +24,7 @@ use crate::application::{
 use crate::domain::{
     Artifact, ArtifactStatus, CachedArtifact, DeliveryChannel, FailureClass, IdentifiedContent,
     Job, JobStatus, MediaIdentity, PlatformKind, ProcessingProfile, UserKind, identify_url,
-    ip_is_public,
+    ip_is_public, metadata_cache_key,
 };
 
 struct LockEntry {
@@ -151,7 +151,7 @@ impl Cache for MemoryCache {
         platform: PlatformKind,
         content_id: &str,
     ) -> Result<Option<MediaMetadata>, AppError> {
-        let key = format!("meta:{platform}:{content_id}");
+        let key = metadata_cache_key(platform, content_id);
         Ok(self.metadata.lock().await.get(&key).and_then(fresh))
     }
     async fn put_metadata(
@@ -161,7 +161,7 @@ impl Cache for MemoryCache {
         meta: &MediaMetadata,
         ttl: Duration,
     ) -> Result<(), AppError> {
-        let key = format!("meta:{platform}:{content_id}");
+        let key = metadata_cache_key(platform, content_id);
         self.metadata.lock().await.insert(
             key,
             CacheEntry { value: meta.clone(), expires: tokio::time::Instant::now() + ttl },
@@ -771,6 +771,31 @@ impl Store for MemoryStore {
             }
         }
         for job_id in requeue {
+            db.next_outbox += 1;
+            let id = db.next_outbox;
+            db.outbox.push(OutboxEvent {
+                id,
+                aggregate_id: job_id,
+                event_type: "job.queued".into(),
+                payload: serde_json::json!({"job_id": job_id}),
+            });
+            recovered.push(job_id);
+        }
+        let due: Vec<Uuid> = db
+            .jobs
+            .iter()
+            .filter(|stored| {
+                stored.job.status == JobStatus::Queued
+                    && stored.locked_by.is_none()
+                    && stored.next_attempt_at.is_some_and(|at| at <= now)
+                    && !db.outbox.iter().any(|event| {
+                        event.aggregate_id == stored.job.id && event.event_type == "job.queued"
+                    })
+            })
+            .map(|stored| stored.job.id)
+            .take(limit as usize)
+            .collect();
+        for job_id in due {
             db.next_outbox += 1;
             let id = db.next_outbox;
             db.outbox.push(OutboxEvent {

@@ -209,6 +209,7 @@ fn worker_set(
     WorkerSet {
         store: app.store.clone(),
         queue: app.redis.clone(),
+        cache: app.redis.clone(),
         pipeline: std::sync::Arc::clone(&app.pipeline),
         storage: app.storage.clone(),
         sender,

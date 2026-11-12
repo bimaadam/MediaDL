@@ -51,7 +51,7 @@ pub struct CanonicalUrl {
 }
 
 /// Identify a platform from an already validated URL. Shorteners and
-/// `facebook.com/share/{token}` links return `None` so the guard can expand them.
+/// `facebook.com/share/...` links return `None` so the guard can expand them.
 pub fn identify_url(url: &Url) -> Result<Option<IdentifiedContent>, DomainError> {
     let host = normalized_host(url).ok_or(DomainError::InvalidUrl)?;
     if let Some(found) = identify_host(url, &host) {
@@ -76,7 +76,8 @@ pub fn is_shortener(host: &str) -> bool {
     matches!(host, "vm.tiktok.com" | "vt.tiktok.com" | "fb.watch" | "t.co" | "redd.it")
 }
 
-/// `facebook.com/share/{token}` has no content id until Facebook redirects it.
+/// Share links have no content id until Facebook redirects them.
+/// `/share/r/`, `/share/v/`, and `/share/p/` are tokens, not reel or post ids.
 pub fn is_opaque_facebook_share(url: &Url) -> bool {
     let Some(host) = normalized_host(url) else {
         return false;
@@ -84,7 +85,11 @@ pub fn is_opaque_facebook_share(url: &Url) -> bool {
     if !(host == "facebook.com" || host.ends_with(".facebook.com")) {
         return false;
     }
-    matches!(segments(url).as_slice(), ["share", id] if is_storage_id(id))
+    match segments(url).as_slice() {
+        ["share", id] if is_storage_id(id) => true,
+        ["share", kind, id] if matches!(*kind, "r" | "v" | "p") && is_storage_id(id) => true,
+        _ => false,
+    }
 }
 
 fn identify_host(url: &Url, host: &str) -> Option<Result<IdentifiedContent, DomainError>> {
@@ -173,9 +178,6 @@ fn facebook_id(url: &Url) -> Option<String> {
         ["reel", id] | ["videos", id] | ["watch", id] if is_storage_id(id) => {
             Some((*id).to_owned())
         }
-        ["share", kind, id] if matches!(*kind, "v" | "r" | "p") && is_storage_id(id) => {
-            Some((*id).to_owned())
-        }
         [_, "videos", id] | [_, "posts", id] | [_, "permalink", id] if is_storage_id(id) => {
             Some((*id).to_owned())
         }
@@ -237,6 +239,11 @@ fn is_loose_id(value: &str) -> bool {
 fn is_direct_media(url: &Url) -> bool {
     let path = url.path().to_ascii_lowercase();
     DIRECT_EXTENSIONS.iter().any(|ext| path.ends_with(&format!(".{ext}")))
+}
+
+/// `img_index` is the carousel slide. That post is a photo, not a video.
+pub fn asks_for_instagram_slide(url: &Url) -> bool {
+    url.query_pairs().any(|(key, value)| key == "img_index" && !value.is_empty())
 }
 
 pub fn strip_tracking(url: &Url) -> String {
@@ -311,6 +318,15 @@ mod tests {
     }
 
     #[test]
+    fn an_instagram_slide_is_a_photo_request() {
+        let slide = url("https://www.instagram.com/p/DfohSk7IDuv/?img_index=2&vrfl=abc");
+        assert!(asks_for_instagram_slide(&slide));
+        let identified = identify_url(&slide).unwrap().unwrap();
+        assert!(identified.canonical_url.contains("img_index=2"));
+        assert!(!asks_for_instagram_slide(&url("https://www.instagram.com/reel/DeOmjz1zFPS/")));
+    }
+
+    #[test]
     fn other_platforms_extract_canonical_ids() {
         let cases = [
             (
@@ -338,7 +354,6 @@ mod tests {
                 PlatformKind::Facebook,
                 "pfbid0abcDEF123",
             ),
-            ("https://www.facebook.com/share/p/AbC123xyz/", PlatformKind::Facebook, "AbC123xyz"),
             (
                 "https://www.facebook.com/groups/example/posts/55667788",
                 PlatformKind::Facebook,
@@ -383,6 +398,16 @@ mod tests {
         assert!(
             identify_url(&url("https://www.facebook.com/share/19ji6Wnxkf/")).unwrap().is_none()
         );
-        assert!(!is_opaque_facebook_share(&url("https://www.facebook.com/share/p/AbC123xyz/")));
+        for raw in [
+            "https://www.facebook.com/share/p/AbC123xyz/",
+            "https://www.facebook.com/share/v/AbC123xyz/",
+            "https://www.facebook.com/share/r/1G49T9jReV/",
+        ] {
+            assert!(is_opaque_facebook_share(&url(raw)), "{raw}");
+            assert!(identify_url(&url(raw)).unwrap().is_none(), "{raw}");
+        }
+        assert!(!is_opaque_facebook_share(&url(
+            "https://www.facebook.com/reel/1699138351147517/"
+        )));
     }
 }

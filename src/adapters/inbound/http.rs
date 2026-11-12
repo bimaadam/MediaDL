@@ -556,7 +556,7 @@ fn parse_profile(
         "jpeg" | "jpg" => Container::Jpeg,
         _ => return Err(AppError::Validation("unsupported container".into())),
     };
-    let profile = ProcessingProfile { kind, quality, container };
+    let profile = ProcessingProfile { kind, quality, container, max_bytes: None };
     profile.validate()?;
     Ok(profile)
 }

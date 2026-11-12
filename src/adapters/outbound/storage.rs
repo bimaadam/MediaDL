@@ -4,6 +4,7 @@
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -15,6 +16,11 @@ use tokio_util::io::ReaderStream;
 use crate::application::{AppError, ObjectBody, ObjectStorage};
 
 const PART_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The HTTP client otherwise stops a request after 10 seconds. A video PUT to
+/// R2 needs longer: an 8 MiB body from this network already takes about 4
+/// seconds, so a larger file dies as a transport error before the object exists.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct S3Storage {
     client: Client,
@@ -36,6 +42,7 @@ impl S3Storage {
             .region(region)
             .auth(Auth::Static(credentials))
             .addressing_style(AddressingStyle::Path)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|error| AppError::Dependency(format!("storage client: {error}")))?;
         Ok(Self { client, bucket: bucket.to_owned() })
@@ -77,7 +84,24 @@ fn missing(error: &s3::Error) -> bool {
 }
 
 fn storage_err(error: s3::Error) -> AppError {
-    AppError::Dependency(format!("object storage: {error}"))
+    let mut text = format!("object storage: {error}");
+    let mut source = std::error::Error::source(&error);
+    let mut cause = String::new();
+    while let Some(next) = source {
+        if !cause.is_empty() {
+            cause.push_str(": ");
+        }
+        cause.push_str(&next.to_string());
+        if cause.chars().count() >= 180 {
+            break;
+        }
+        source = next.source();
+    }
+    if !cause.is_empty() {
+        text.push_str(": ");
+        text.push_str(&cause);
+    }
+    AppError::Dependency(text)
 }
 
 struct UnpinReader {
@@ -243,5 +267,26 @@ impl S3Storage {
             part_number = part_number.saturating_add(1);
         }
         Ok(parts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_timeout_exceeds_the_ten_second_client_default() {
+        assert!(REQUEST_TIMEOUT > Duration::from_secs(10));
+    }
+
+    #[test]
+    fn storage_errors_include_the_transport_cause() {
+        let error = s3::Error::transport(
+            "request failed",
+            Some(Box::new(std::io::Error::other("phase=transport timeout_ms=10000"))),
+        );
+        let text = storage_err(error).to_string();
+        assert!(text.contains("request failed"), "{text}");
+        assert!(text.contains("timeout_ms=10000"), "{text}");
     }
 }
